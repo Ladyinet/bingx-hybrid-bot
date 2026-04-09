@@ -144,7 +144,7 @@ def now_iso() -> str:
 def normalize_tv_symbol_to_ccxt(raw_symbol: str) -> Tuple[str, str]:
     """
     Converts common TradingView/BingX symbols like:
-      BTCUSDT, BTC-USDT, BTC/USDT, BTC/USDT:USDT
+      BTCUSDT, BTCUSDT.P, BINGX:BTCUSDT.P, BTC-USDT, BTC/USDT, BTC/USDT:USDT
     into CCXT unified swap symbol like:
       BTC/USDT:USDT
     Returns: (ccxt_symbol, compact_symbol)
@@ -152,6 +152,13 @@ def normalize_tv_symbol_to_ccxt(raw_symbol: str) -> Tuple[str, str]:
     s = (raw_symbol or "").strip().upper()
     if not s:
         raise ValueError("Empty symbol")
+
+    # TradingView tickerid can include an exchange prefix like BINGX:BTCUSDT.P
+    if ":" in s and "/" not in s:
+        s = s.split(":", 1)[1]
+
+    # Common perpetual suffixes used by TradingView / exchanges.
+    s = re.sub(r"(\.P|[-_]?PERP|[-_]?SWAP)$", "", s)
 
     # Already unified CCXT symbol
     if "/" in s and ":" in s:
@@ -166,6 +173,7 @@ def normalize_tv_symbol_to_ccxt(raw_symbol: str) -> Tuple[str, str]:
         return f"{base}/{quote}:{quote}", f"{base}{quote}"
 
     compact = re.sub(r"[^A-Z0-9]", "", s)
+    compact = re.sub(r"(PERP|SWAP|P)$", "", compact)
 
     if compact.endswith(DEFAULT_SETTLE):
         base = compact[: -len(DEFAULT_SETTLE)]

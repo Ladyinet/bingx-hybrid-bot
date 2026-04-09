@@ -1,0 +1,19 @@
+Як запустити сервер правильно (покроково)
+
+
+Перейди в папку ботаBashcd /home/bot/apps/happyusers/bingx-hybrid-bot
+Активуй віртуальне середовищеBashsource .venv/bin/activate
+Створи файл .env (обов’язково!)Bashnano .envВстав туди мінімум таке (можна залишити DRY_RUN=true на початку):envBINGX_API_KEY=твій_ключ_з_bingx
+BINGX_SECRET=твій_secret_з_bingx
+WEBHOOK_SECRET=ДОВГИЙ_РАНДОМНИЙ_СЕКРЕТ_ТУТ_наприклад_12345abcde67890xyz
+ALLOWED_SYMBOLS=*
+DEFAULT_SETTLE=USDT
+DEFAULT_MARGIN_MODE=cross
+DRY_RUN=true
+PORT=8000Збережіть (Ctrl+O → Enter → Ctrl+X).
+Запусти сервер через uvicorn (найнадійніший спосіб):Bashuvicorn app:app --host 127.0.0.1 --port 8000 --log-level infoТи маєш побачити приблизно таке:textINFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process...
+INFO:     Started server process...
+Перевір, що сервер живий (в новому терміналі):Bashcurl http://127.0.0.1:8000/healthОчікувана відповідь:JSON{"status":"ok","dry_run":true,...}
+
+Після того як сервер запуститься
