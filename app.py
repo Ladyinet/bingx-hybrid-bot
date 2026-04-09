@@ -418,6 +418,15 @@ def process_payload(payload: WebhookPayload) -> Dict[str, Any]:
 
     action = payload.action.strip().upper()
 
+    if action == "TEST_ALERT":
+        return {
+            "status": "test_ok",
+            "action": action,
+            "symbol": ccxt_symbol,
+            "compact_symbol": compact_symbol,
+            "reason": payload.reason or "MANUAL_HYBRID_DEBUG",
+        }
+
     if action in {"FIRST_SHORT", "RESTART_SHORT", "DCA_SHORT"}:
         return handle_entry_like_action(payload, ccxt_symbol)
 
