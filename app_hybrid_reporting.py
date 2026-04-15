@@ -850,6 +850,85 @@ def build_summary() -> Dict[str, Any]:
     }
 
 
+def _load_json_dict(raw: Any) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        loaded = json.loads(raw)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def build_event_report_rows(events: List[Dict[str, Any]], snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    snapshots_by_event: Dict[str, List[Dict[str, Any]]] = {}
+    for snapshot in snapshots:
+        snapshots_by_event.setdefault(str(snapshot.get("event_id")), []).append(snapshot)
+
+    rows: List[Dict[str, Any]] = []
+
+    for event in events:
+        event_id = str(event.get("event_id"))
+        related = snapshots_by_event.get(event_id, [])
+        pre_snapshot = next((s for s in related if str(s.get("stage", "")).startswith("pre_")), None)
+        post_snapshot = next((s for s in related if str(s.get("stage", "")).startswith("post_")), None)
+        rejected_snapshot = next((s for s in related if "rejected" in str(s.get("stage", ""))), None)
+
+        result_json = _load_json_dict(event.get("result_json"))
+        request_json = _load_json_dict(event.get("request_json"))
+        reconcile = result_json.get("reconcile", {})
+        pre_from_result = _load_json_dict(reconcile.get("pre_snapshot"))
+        post_from_result = _load_json_dict(reconcile.get("post_snapshot"))
+
+        effective_pre = pre_snapshot or {
+            "side": pre_from_result.get("side"),
+            "contracts": pre_from_result.get("contracts"),
+            "entry_price": pre_from_result.get("entryPrice"),
+            "mark_price": pre_from_result.get("markPrice"),
+            "unrealized_pnl": pre_from_result.get("unrealizedPnl"),
+            "market_price": None,
+        }
+        effective_post = post_snapshot or rejected_snapshot or {
+            "side": post_from_result.get("side"),
+            "contracts": post_from_result.get("contracts"),
+            "entry_price": post_from_result.get("entryPrice"),
+            "mark_price": post_from_result.get("markPrice"),
+            "unrealized_pnl": post_from_result.get("unrealizedPnl"),
+            "market_price": result_json.get("market_price"),
+        }
+
+        row = {
+            "created_at": event.get("created_at"),
+            "symbol": event.get("symbol_compact") or event.get("symbol_raw"),
+            "action": event.get("action"),
+            "status": event.get("status"),
+            "mode": event.get("mode"),
+            "dry_run": event.get("dry_run"),
+            "order_id": event.get("order_id"),
+            "lot_tag": event.get("lot_tag"),
+            "reason": event.get("reason"),
+            "pre_side": effective_pre.get("side"),
+            "pre_contracts": effective_pre.get("contracts"),
+            "pre_entry_price": effective_pre.get("entry_price"),
+            "post_side": effective_post.get("side"),
+            "post_contracts": effective_post.get("contracts"),
+            "post_entry_price": effective_post.get("entry_price"),
+            "market_price": effective_post.get("market_price") or result_json.get("market_price"),
+            "tp_price": result_json.get("tp_price"),
+            "reconcile_status": reconcile.get("reconcile_status") or _load_json_dict(effective_post.get("extra_json")).get("reconcile_status"),
+            "error_text": event.get("error_text"),
+        }
+
+        if row["reason"] is None:
+            row["reason"] = request_json.get("reason")
+
+        rows.append(row)
+
+    return rows
+
+
 def autosize_worksheet(ws: Any) -> None:
     for column_cells in ws.columns:
         max_length = 0
@@ -871,15 +950,21 @@ def build_excel_report() -> Path:
     summary = build_summary()
     events = fetch_recent_events(limit=5000)
     snapshots = fetch_recent_snapshots(limit=10000)
+    event_report_rows = build_event_report_rows(events, snapshots)
 
     workbook = Workbook()
     ws_summary = workbook.active
     ws_summary.title = "Summary"
+    ws_event_report = workbook.create_sheet("Event Report")
     ws_events = workbook.create_sheet("Events")
     ws_snapshots = workbook.create_sheet("Snapshots")
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
+    success_fill = PatternFill("solid", fgColor="C6EFCE")
+    warning_fill = PatternFill("solid", fgColor="FFEB9C")
+    error_fill = PatternFill("solid", fgColor="FFC7CE")
+    neutral_fill = PatternFill("solid", fgColor="D9EAD3")
 
     summary_rows = [
         ("Generated At", summary["generated_at"]),
@@ -895,6 +980,51 @@ def build_excel_report() -> Path:
     for row_index, (label, value) in enumerate(summary_rows, start=1):
         ws_summary.cell(row=row_index, column=1, value=label)
         ws_summary.cell(row=row_index, column=2, value=value)
+
+    event_report_headers = [
+        "created_at",
+        "symbol",
+        "action",
+        "status",
+        "mode",
+        "dry_run",
+        "order_id",
+        "lot_tag",
+        "reason",
+        "pre_side",
+        "pre_contracts",
+        "pre_entry_price",
+        "post_side",
+        "post_contracts",
+        "post_entry_price",
+        "market_price",
+        "tp_price",
+        "reconcile_status",
+        "error_text",
+    ]
+    for col, header in enumerate(event_report_headers, start=1):
+        cell = ws_event_report.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for row_idx, row in enumerate(event_report_rows, start=2):
+        for col, header in enumerate(event_report_headers, start=1):
+            ws_event_report.cell(row=row_idx, column=col, value=row.get(header))
+
+        status_value = str(row.get("status") or "").lower()
+        fill = None
+        if status_value == "executed":
+            fill = success_fill
+        elif status_value in {"tp_not_reached", "duplicate_ignored", "startup_synced", "startup_skipped", "startup_partial"}:
+            fill = warning_fill
+        elif status_value in {"error", "startup_error"}:
+            fill = error_fill
+        elif status_value in {"no_position", "ignored"}:
+            fill = neutral_fill
+
+        if fill is not None:
+            for col in range(1, len(event_report_headers) + 1):
+                ws_event_report.cell(row=row_idx, column=col).fill = fill
 
     event_headers = [
         "event_id",
@@ -948,6 +1078,7 @@ def build_excel_report() -> Path:
             ws_snapshots.cell(row=row_idx, column=col, value=row.get(header))
 
     autosize_worksheet(ws_summary)
+    autosize_worksheet(ws_event_report)
     autosize_worksheet(ws_events)
     autosize_worksheet(ws_snapshots)
 
