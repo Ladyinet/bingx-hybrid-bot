@@ -9,6 +9,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 import ccxt
 from dotenv import load_dotenv
@@ -39,6 +42,9 @@ REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "reports"))
 REPORT_FILENAME = os.getenv("REPORT_FILENAME", "bingx_hybrid_report.xlsx").strip() or "bingx_hybrid_report.xlsx"
 RECONCILE_POLL_COUNT = int(os.getenv("RECONCILE_POLL_COUNT", "3"))
 RECONCILE_POLL_DELAY_SEC = float(os.getenv("RECONCILE_POLL_DELAY_SEC", "0.8"))
+LOG_TG_TOKEN = os.getenv("LOG_TG_TOKEN", "").strip()
+LOG_TG_CHAT_ID = os.getenv("LOG_TG_CHAT_ID", "").strip()
+LOG_TG_TIMEOUT_SEC = float(os.getenv("LOG_TG_TIMEOUT_SEC", "10"))
 
 if ALLOWED_SYMBOLS_RAW == "*":
     ALLOWED_SYMBOLS = {"*"}
@@ -72,6 +78,8 @@ _markets_loaded = False
 _markets_lock = threading.Lock()
 _recent_events: Dict[str, float] = {}
 _recent_lock = threading.Lock()
+_log_tg_lock = threading.Lock()
+_cached_log_tg_chat_id: Optional[str] = LOG_TG_CHAT_ID or None
 
 
 class WebhookPayload(BaseModel):
@@ -126,6 +134,15 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def safe_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -137,6 +154,268 @@ def new_event_id() -> str:
 def ensure_storage_ready() -> None:
     JOURNAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def first_number(*values: Any, allow_zero: bool = False) -> Optional[float]:
+    for value in values:
+        number = optional_float(value)
+        if number is None:
+            continue
+        if allow_zero or number != 0:
+            return number
+    return None
+
+
+def first_value(*values: Any) -> Any:
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
+def format_number(value: Any, *, digits: int = 8) -> str:
+    number = optional_float(value)
+    if number is None:
+        return "-"
+    text = f"{number:.{digits}f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def format_value(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    return str(value)
+
+
+def snapshot_metric(snapshot: Optional[Dict[str, Any]], *keys: str, allow_zero: bool = True) -> Optional[float]:
+    if not snapshot:
+        return None
+    return first_number(*(snapshot.get(key) for key in keys), allow_zero=allow_zero)
+
+
+def snapshot_value(snapshot: Optional[Dict[str, Any]], *keys: str) -> Any:
+    if not snapshot:
+        return None
+    return first_value(*(snapshot.get(key) for key in keys))
+
+
+def snapshot_to_report_dict(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    snap = snapshot or {}
+    return {
+        "side": snapshot_value(snap, "side"),
+        "contracts": snapshot_metric(snap, "contracts", allow_zero=True),
+        "entry_price": snapshot_metric(snap, "entry_price", "entryPrice"),
+        "mark_price": snapshot_metric(snap, "mark_price", "markPrice"),
+        "unrealized_pnl": snapshot_metric(snap, "unrealized_pnl", "unrealizedPnl", allow_zero=True),
+        "market_price": snapshot_metric(snap, "market_price"),
+        "order_id": snapshot_value(snap, "order_id", "orderId"),
+        "extra_json": _load_json_dict(snapshot_value(snap, "extra_json", "extra")),
+    }
+
+
+def extract_order_execution_price(order: Optional[Dict[str, Any]], fallback_price: Any = None) -> Optional[float]:
+    info = order.get("info") if isinstance(order, dict) and isinstance(order.get("info"), dict) else {}
+    return first_number(
+        order.get("average") if isinstance(order, dict) else None,
+        order.get("price") if isinstance(order, dict) else None,
+        info.get("avgPrice"),
+        info.get("averagePrice"),
+        info.get("price"),
+        info.get("dealPrice"),
+        info.get("executedPrice"),
+        fallback_price,
+    )
+
+
+def telegram_logging_enabled() -> bool:
+    return bool(LOG_TG_TOKEN)
+
+
+def telegram_api_call(method: str, params: Dict[str, Any]) -> Any:
+    encoded = urllib_parse.urlencode({k: v for k, v in params.items() if v is not None}).encode("utf-8")
+    request = urllib_request.Request(
+        f"https://api.telegram.org/bot{LOG_TG_TOKEN}/{method}",
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib_request.urlopen(request, timeout=max(LOG_TG_TIMEOUT_SEC, 1.0)) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("description") or f"Telegram API {method} failed")
+    return payload.get("result")
+
+
+def extract_chat_id_from_update(update: Dict[str, Any]) -> Optional[str]:
+    chat_sources = [
+        update.get("message"),
+        update.get("edited_message"),
+        update.get("channel_post"),
+        update.get("edited_channel_post"),
+        (update.get("callback_query") or {}).get("message"),
+        update.get("my_chat_member"),
+        update.get("chat_member"),
+    ]
+    for source in chat_sources:
+        if not isinstance(source, dict):
+            continue
+        chat = source.get("chat")
+        if isinstance(chat, dict) and chat.get("id") is not None:
+            return str(chat["id"])
+    return None
+
+
+def resolve_log_tg_chat_id() -> Optional[str]:
+    global _cached_log_tg_chat_id
+    if _cached_log_tg_chat_id:
+        return _cached_log_tg_chat_id
+    if not telegram_logging_enabled():
+        return None
+
+    with _log_tg_lock:
+        if _cached_log_tg_chat_id:
+            return _cached_log_tg_chat_id
+        try:
+            updates = telegram_api_call("getUpdates", {"limit": 20, "timeout": 0}) or []
+        except Exception as exc:
+            logger.warning("Telegram chat_id auto-discovery failed: %s", exc)
+            return None
+
+        for update in reversed(updates):
+            chat_id = extract_chat_id_from_update(update if isinstance(update, dict) else {})
+            if chat_id:
+                _cached_log_tg_chat_id = chat_id
+                logger.info("Resolved Telegram log chat_id automatically: %s", chat_id)
+                return chat_id
+
+    return None
+
+
+def chunk_telegram_message(text: str, limit: int = 3900) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: List[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+
+
+def send_telegram_log(text: str) -> None:
+    if not telegram_logging_enabled():
+        return
+    chat_id = resolve_log_tg_chat_id()
+    if not chat_id:
+        logger.warning("Telegram logging skipped: LOG_TG_CHAT_ID is not set and no chat_id could be auto-discovered")
+        return
+    for chunk in chunk_telegram_message(text):
+        try:
+            telegram_api_call("sendMessage", {"chat_id": chat_id, "text": chunk})
+        except (urllib_error.URLError, RuntimeError, ValueError) as exc:
+            logger.warning("Telegram log send failed: %s", exc)
+            return
+
+
+def build_alert_accept_message(event_id: str, payload: WebhookPayload) -> str:
+    lines = [
+        "ALERT ACCEPTED",
+        f"event_id={event_id}",
+        f"action={format_value(payload.action)}",
+        f"symbol={format_value(payload.symbol)}",
+        f"dry_run={DRY_RUN}",
+        f"order_id={format_value(payload.orderId)}",
+        f"lot_tag={format_value(payload.lotTag)}",
+        f"reason={format_value(payload.reason)}",
+        f"qty_coin={format_number(payload.qtyCoin)}",
+        f"trigger_price={format_number(payload.triggerPrice)}",
+        f"fill_price={format_number(payload.fillPrice)}",
+        f"entry_price={format_number(payload.entryPrice)}",
+        f"theoretical_avg={format_number(payload.theoreticalAvg)}",
+        f"tp_price={format_number(payload.tpPrice)}",
+        f"lot_tp_price={format_number(payload.lotTpPrice)}",
+        f"current_close={format_number(payload.currentClose)}",
+        f"timestamp={format_value(payload.timestamp)}",
+    ]
+    return "\n".join(lines)
+
+
+def build_duplicate_alert_message(payload: WebhookPayload) -> str:
+    lines = [
+        "ALERT DUPLICATE IGNORED",
+        f"action={format_value(payload.action)}",
+        f"symbol={format_value(payload.symbol)}",
+        f"order_id={format_value(payload.orderId)}",
+        f"lot_tag={format_value(payload.lotTag)}",
+        f"qty_coin={format_number(payload.qtyCoin)}",
+        f"timestamp={format_value(payload.timestamp)}",
+    ]
+    return "\n".join(lines)
+
+
+def build_result_log_message(event_id: str, payload: WebhookPayload, result: Dict[str, Any]) -> str:
+    reconcile = result.get("reconcile", {}) if isinstance(result.get("reconcile"), dict) else {}
+    pre_snapshot = snapshot_to_report_dict(reconcile.get("pre_snapshot"))
+    post_snapshot = snapshot_to_report_dict(reconcile.get("post_snapshot"))
+
+    action = str(payload.action or "").upper()
+    if action in {"FIRST_SHORT", "RESTART_SHORT", "DCA_SHORT"}:
+        actual_entry_price = first_number(
+            result.get("entry_price"),
+            post_snapshot.get("entry_price"),
+            payload.fillPrice,
+            payload.entryPrice,
+            payload.theoreticalAvg,
+        )
+        actual_exit_price = None
+    else:
+        actual_entry_price = first_number(
+            result.get("entry_price"),
+            pre_snapshot.get("entry_price"),
+            payload.entryPrice,
+            payload.theoreticalAvg,
+        )
+        actual_exit_price = first_number(
+            result.get("exit_price"),
+            result.get("market_price"),
+            payload.currentClose,
+            payload.fillPrice,
+        )
+
+    lines = [
+        "ALERT RESULT",
+        f"event_id={event_id}",
+        f"action={format_value(payload.action)}",
+        f"symbol={format_value(result.get('symbol') or payload.symbol)}",
+        f"status={format_value(result.get('status'))}",
+        f"dry_run={DRY_RUN}",
+        f"order_id={format_value(result.get('order_id') or payload.orderId)}",
+        f"reconcile_status={format_value(reconcile.get('reconcile_status'))}",
+        f"requested_qty={format_number(first_number(payload.qtyCoin, result.get('qty'), result.get('requested_qty'), allow_zero=True))}",
+        f"closed_qty={format_number(first_number(result.get('closed_qty'), allow_zero=True))}",
+        f"actual_entry_price={format_number(actual_entry_price)}",
+        f"actual_exit_price={format_number(actual_exit_price)}",
+        f"market_price={format_number(first_number(result.get('market_price'), post_snapshot.get('market_price')))}",
+        f"tp_price={format_number(first_number(result.get('tp_price'), payload.tpPrice))}",
+        f"lot_tp_price={format_number(first_number(result.get('lot_tp_price'), payload.lotTpPrice))}",
+        f"pre_contracts={format_number(pre_snapshot.get('contracts'))}",
+        f"pre_entry_price={format_number(pre_snapshot.get('entry_price'))}",
+        f"post_contracts={format_number(post_snapshot.get('contracts'))}",
+        f"post_entry_price={format_number(post_snapshot.get('entry_price'))}",
+    ]
+
+    error_text = result.get("error_text")
+    if error_text:
+        lines.append(f"error={format_value(error_text)}")
+
+    return "\n".join(lines)
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -493,6 +772,7 @@ def reconcile_after_order(ccxt_symbol: str, pre_snapshot: Dict[str, Any]) -> Dic
         pre_contracts = safe_float(pre_snapshot.get("contracts"), 0.0)
         return {
             "reconcile_status": "dry_run" if DRY_RUN else "no_exchange_credentials",
+            "pre_snapshot": pre_snapshot,
             "pre_contracts": pre_contracts,
             "post_contracts": pre_contracts,
             "post_snapshot": pre_snapshot,
@@ -521,6 +801,7 @@ def reconcile_after_order(ccxt_symbol: str, pre_snapshot: Dict[str, Any]) -> Dic
 
     return {
         "reconcile_status": reconcile_status,
+        "pre_snapshot": pre_snapshot,
         "pre_contracts": pre_contracts,
         "post_contracts": post_contracts,
         "post_snapshot": post_snapshot,
@@ -534,6 +815,13 @@ def handle_entry_like_action(payload: WebhookPayload, event_id: str, ccxt_symbol
 
     order = place_short_market_entry(ccxt_symbol, qty, payload)
     reconcile = reconcile_after_order(ccxt_symbol, pre_snapshot)
+    entry_price = first_number(
+        extract_order_execution_price(order, payload.fillPrice),
+        snapshot_metric(reconcile.get("post_snapshot"), "entryPrice"),
+        payload.fillPrice,
+        payload.entryPrice,
+        payload.theoreticalAvg,
+    )
     record_snapshot(
         event_id,
         "post_entry",
@@ -541,7 +829,7 @@ def handle_entry_like_action(payload: WebhookPayload, event_id: str, ccxt_symbol
         ccxt_symbol,
         reconcile["post_snapshot"],
         order_id=order.get("id"),
-        extra={"reconcile_status": reconcile["reconcile_status"]},
+        extra={"reconcile_status": reconcile["reconcile_status"], "entry_price": entry_price},
     )
 
     return {
@@ -550,6 +838,7 @@ def handle_entry_like_action(payload: WebhookPayload, event_id: str, ccxt_symbol
         "symbol": ccxt_symbol,
         "compact_symbol": compact_symbol,
         "qty": qty,
+        "entry_price": entry_price,
         "order_id": order.get("id"),
         "reconcile": reconcile,
     }
@@ -605,6 +894,7 @@ def handle_full_tp_close(payload: WebhookPayload, event_id: str, ccxt_symbol: st
 
     order = close_short_reduce_only(ccxt_symbol, qty, payload.reason or "FULL_TP_CLOSE")
     reconcile = reconcile_after_order(ccxt_symbol, real_pos)
+    exit_price = first_number(extract_order_execution_price(order, current_price), current_price, payload.currentClose)
     record_snapshot(
         event_id,
         "post_full_tp",
@@ -613,13 +903,15 @@ def handle_full_tp_close(payload: WebhookPayload, event_id: str, ccxt_symbol: st
         reconcile["post_snapshot"],
         market_price=current_price,
         order_id=order.get("id"),
-        extra={"tp_price": tp_price, "reconcile_status": reconcile["reconcile_status"]},
+        extra={"tp_price": tp_price, "reconcile_status": reconcile["reconcile_status"], "exit_price": exit_price, "entry_price": real_avg, "closed_qty": qty},
     )
     return {
         "status": "executed",
         "action": payload.action,
         "symbol": ccxt_symbol,
         "compact_symbol": compact_symbol,
+        "entry_price": real_avg,
+        "exit_price": exit_price,
         "real_avg": real_avg,
         "tp_price": tp_price,
         "market_price": current_price,
@@ -668,6 +960,8 @@ def handle_subcover_close(payload: WebhookPayload, event_id: str, ccxt_symbol: s
 
     order = close_short_reduce_only(ccxt_symbol, close_qty, "SUBCOVER_CLOSE")
     reconcile = reconcile_after_order(ccxt_symbol, real_pos)
+    entry_price = first_number(payload.entryPrice, safe_float(real_pos.get("entryPrice"), 0.0))
+    exit_price = first_number(extract_order_execution_price(order, current_price), current_price, payload.currentClose)
     record_snapshot(
         event_id,
         "post_subcover",
@@ -676,13 +970,23 @@ def handle_subcover_close(payload: WebhookPayload, event_id: str, ccxt_symbol: s
         reconcile["post_snapshot"],
         market_price=current_price,
         order_id=order.get("id"),
-        extra={"requested_qty": requested_qty, "closed_qty": close_qty, "reconcile_status": reconcile["reconcile_status"]},
+        extra={
+            "requested_qty": requested_qty,
+            "closed_qty": close_qty,
+            "reconcile_status": reconcile["reconcile_status"],
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "lot_tp_price": lot_tp,
+        },
     )
     return {
         "status": "executed",
         "action": payload.action,
         "symbol": ccxt_symbol,
         "compact_symbol": compact_symbol,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "lot_tp_price": lot_tp,
         "requested_qty": requested_qty,
         "closed_qty": close_qty,
         "market_price": current_price,
@@ -735,9 +1039,21 @@ def background_process(payload: WebhookPayload, event_id: str) -> None:
             result=result,
         )
         logger.info("Webhook processed | event_id=%s | action=%s | result=%s", event_id, payload.action, result)
+        send_telegram_log(build_result_log_message(event_id, payload, result))
     except Exception as exc:
         update_event_status(event_id, status="error", error_text=str(exc))
         logger.exception("Webhook processing failed | event_id=%s | action=%s | symbol=%s | error=%s", event_id, payload.action, payload.symbol, exc)
+        send_telegram_log(
+            "\n".join(
+                [
+                    "ALERT ERROR",
+                    f"event_id={event_id}",
+                    f"action={format_value(payload.action)}",
+                    f"symbol={format_value(payload.symbol)}",
+                    f"error={format_value(exc)}",
+                ]
+            )
+        )
 
 
 def run_startup_sync() -> None:
@@ -879,25 +1195,60 @@ def build_event_report_rows(events: List[Dict[str, Any]], snapshots: List[Dict[s
         result_json = _load_json_dict(event.get("result_json"))
         request_json = _load_json_dict(event.get("request_json"))
         reconcile = result_json.get("reconcile", {})
-        pre_from_result = _load_json_dict(reconcile.get("pre_snapshot"))
-        post_from_result = _load_json_dict(reconcile.get("post_snapshot"))
+        pre_from_result = snapshot_to_report_dict(_load_json_dict(reconcile.get("pre_snapshot")))
+        post_from_result = snapshot_to_report_dict(_load_json_dict(reconcile.get("post_snapshot")))
 
-        effective_pre = pre_snapshot or {
-            "side": pre_from_result.get("side"),
-            "contracts": pre_from_result.get("contracts"),
-            "entry_price": pre_from_result.get("entryPrice"),
-            "mark_price": pre_from_result.get("markPrice"),
-            "unrealized_pnl": pre_from_result.get("unrealizedPnl"),
-            "market_price": None,
-        }
-        effective_post = post_snapshot or rejected_snapshot or {
-            "side": post_from_result.get("side"),
-            "contracts": post_from_result.get("contracts"),
-            "entry_price": post_from_result.get("entryPrice"),
-            "mark_price": post_from_result.get("markPrice"),
-            "unrealized_pnl": post_from_result.get("unrealizedPnl"),
-            "market_price": result_json.get("market_price"),
-        }
+        effective_pre = snapshot_to_report_dict(pre_snapshot) if pre_snapshot else pre_from_result
+        effective_post = (
+            snapshot_to_report_dict(post_snapshot)
+            if post_snapshot
+            else snapshot_to_report_dict(rejected_snapshot)
+            if rejected_snapshot
+            else post_from_result
+        )
+        effective_post_extra = _load_json_dict(effective_post.get("extra_json"))
+
+        requested_qty = first_number(request_json.get("qtyCoin"), result_json.get("qty"), result_json.get("requested_qty"), allow_zero=True)
+        closed_qty = first_number(result_json.get("closed_qty"), allow_zero=True)
+        requested_trigger_price = first_number(request_json.get("triggerPrice"))
+        requested_fill_price = first_number(request_json.get("fillPrice"))
+        requested_entry_price = first_number(request_json.get("entryPrice"))
+        requested_theoretical_avg = first_number(request_json.get("theoreticalAvg"))
+        requested_tp_price = first_number(request_json.get("tpPrice"), result_json.get("tp_price"))
+        requested_lot_tp_price = first_number(request_json.get("lotTpPrice"), result_json.get("lot_tp_price"))
+        requested_current_close = first_number(request_json.get("currentClose"))
+        pre_entry_price = first_number(effective_pre.get("entry_price"))
+        post_entry_price = first_number(effective_post.get("entry_price"))
+        pre_mark_price = first_number(effective_pre.get("mark_price"))
+        post_mark_price = first_number(effective_post.get("mark_price"))
+        market_price = first_number(effective_post.get("market_price"), result_json.get("market_price"), requested_current_close)
+
+        action = str(event.get("action") or "").upper()
+        if action in {"FIRST_SHORT", "RESTART_SHORT", "DCA_SHORT"}:
+            actual_entry_price = first_number(
+                result_json.get("entry_price"),
+                effective_post_extra.get("entry_price"),
+                post_entry_price,
+                requested_fill_price,
+                requested_entry_price,
+                requested_theoretical_avg,
+            )
+            actual_exit_price = None
+        else:
+            actual_entry_price = first_number(
+                result_json.get("entry_price"),
+                effective_post_extra.get("entry_price"),
+                pre_entry_price,
+                requested_entry_price,
+                requested_theoretical_avg,
+            )
+            actual_exit_price = first_number(
+                result_json.get("exit_price"),
+                effective_post_extra.get("exit_price"),
+                market_price,
+                requested_current_close,
+                requested_fill_price,
+            )
 
         row = {
             "created_at": event.get("created_at"),
@@ -911,12 +1262,24 @@ def build_event_report_rows(events: List[Dict[str, Any]], snapshots: List[Dict[s
             "reason": event.get("reason"),
             "pre_side": effective_pre.get("side"),
             "pre_contracts": effective_pre.get("contracts"),
-            "pre_entry_price": effective_pre.get("entry_price"),
+            "pre_entry_price": pre_entry_price,
+            "pre_mark_price": pre_mark_price,
             "post_side": effective_post.get("side"),
             "post_contracts": effective_post.get("contracts"),
-            "post_entry_price": effective_post.get("entry_price"),
-            "market_price": effective_post.get("market_price") or result_json.get("market_price"),
-            "tp_price": result_json.get("tp_price"),
+            "post_entry_price": post_entry_price,
+            "post_mark_price": post_mark_price,
+            "requested_qty": requested_qty,
+            "closed_qty": closed_qty,
+            "requested_trigger_price": requested_trigger_price,
+            "requested_fill_price": requested_fill_price,
+            "requested_entry_price": requested_entry_price,
+            "requested_theoretical_avg": requested_theoretical_avg,
+            "requested_current_close": requested_current_close,
+            "actual_entry_price": actual_entry_price,
+            "actual_exit_price": actual_exit_price,
+            "market_price": market_price,
+            "tp_price": requested_tp_price,
+            "lot_tp_price": requested_lot_tp_price,
             "reconcile_status": reconcile.get("reconcile_status") or _load_json_dict(effective_post.get("extra_json")).get("reconcile_status"),
             "error_text": event.get("error_text"),
         }
@@ -956,6 +1319,7 @@ def build_excel_report() -> Path:
     ws_summary = workbook.active
     ws_summary.title = "Summary"
     ws_event_report = workbook.create_sheet("Event Report")
+    ws_act_event_report = workbook.create_sheet("Act Event Report")
     ws_events = workbook.create_sheet("Events")
     ws_snapshots = workbook.create_sheet("Snapshots")
 
@@ -991,14 +1355,26 @@ def build_excel_report() -> Path:
         "order_id",
         "lot_tag",
         "reason",
+        "requested_qty",
+        "closed_qty",
         "pre_side",
         "pre_contracts",
         "pre_entry_price",
+        "pre_mark_price",
         "post_side",
         "post_contracts",
         "post_entry_price",
+        "post_mark_price",
+        "requested_trigger_price",
+        "requested_fill_price",
+        "requested_entry_price",
+        "requested_theoretical_avg",
+        "requested_current_close",
+        "actual_entry_price",
+        "actual_exit_price",
         "market_price",
         "tp_price",
+        "lot_tp_price",
         "reconcile_status",
         "error_text",
     ]
@@ -1025,6 +1401,63 @@ def build_excel_report() -> Path:
         if fill is not None:
             for col in range(1, len(event_report_headers) + 1):
                 ws_event_report.cell(row=row_idx, column=col).fill = fill
+
+    act_event_report_headers = [
+        "created_at",
+        "symbol",
+        "action",
+        "status",
+        "mode",
+        "dry_run",
+        "order_id",
+        "lot_tag",
+        "reason",
+        "requested_qty",
+        "closed_qty",
+        "requested_trigger_price",
+        "requested_fill_price",
+        "requested_entry_price",
+        "requested_theoretical_avg",
+        "requested_current_close",
+        "actual_entry_price",
+        "actual_exit_price",
+        "tp_price",
+        "lot_tp_price",
+        "market_price",
+        "pre_side",
+        "pre_contracts",
+        "pre_entry_price",
+        "pre_mark_price",
+        "post_side",
+        "post_contracts",
+        "post_entry_price",
+        "post_mark_price",
+        "reconcile_status",
+        "error_text",
+    ]
+    for col, header in enumerate(act_event_report_headers, start=1):
+        cell = ws_act_event_report.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for row_idx, row in enumerate(event_report_rows, start=2):
+        for col, header in enumerate(act_event_report_headers, start=1):
+            ws_act_event_report.cell(row=row_idx, column=col, value=row.get(header))
+
+        status_value = str(row.get("status") or "").lower()
+        fill = None
+        if status_value == "executed":
+            fill = success_fill
+        elif status_value in {"tp_not_reached", "duplicate_ignored", "startup_synced", "startup_skipped", "startup_partial"}:
+            fill = warning_fill
+        elif status_value in {"error", "startup_error"}:
+            fill = error_fill
+        elif status_value in {"no_position", "ignored"}:
+            fill = neutral_fill
+
+        if fill is not None:
+            for col in range(1, len(act_event_report_headers) + 1):
+                ws_act_event_report.cell(row=row_idx, column=col).fill = fill
 
     event_headers = [
         "event_id",
@@ -1079,6 +1512,7 @@ def build_excel_report() -> Path:
 
     autosize_worksheet(ws_summary)
     autosize_worksheet(ws_event_report)
+    autosize_worksheet(ws_act_event_report)
     autosize_worksheet(ws_events)
     autosize_worksheet(ws_snapshots)
 
@@ -1103,6 +1537,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> Dict[s
 
     if not register_event_once(payload):
         logger.warning("Duplicate webhook ignored | action=%s | symbol=%s | orderId=%s", payload.action, payload.symbol, payload.orderId)
+        send_telegram_log(build_duplicate_alert_message(payload))
         return {
             "status": "duplicate_ignored",
             "action": payload.action,
@@ -1121,6 +1556,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> Dict[s
         payload.orderId,
         payload.qtyCoin,
     )
+    send_telegram_log(build_alert_accept_message(event_id, payload))
 
     background_tasks.add_task(background_process, payload, event_id)
     return {
